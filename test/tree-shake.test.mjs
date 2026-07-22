@@ -28,11 +28,12 @@ function createFixture() {
     join(src, 'button/button.json'),
     JSON.stringify({ usingComponents: { 't-loading': '../loading/loading' } }),
   );
-  write(join(src, 'button/button.js'), "import '../common/index.js';\n");
+  write(join(src, 'button/button.js'), "import{helper}from'tslib';import'../common/index.js';\nvoid helper;\n");
   write(join(src, 'button/button.wxml'), '<t-loading />\n');
   write(join(src, 'loading/loading.json'), '{}\n');
   write(join(src, 'loading/loading.js'));
   write(join(src, 'common/index.js'));
+  write(join(src, 'miniprogram_npm/tslib/index.js'), 'export const helper = true;\n');
   write(join(src, 'unused/unused.json'), '{}\n');
   write(join(src, 'unused/unused.js'));
   write(join(src, '.wechatide.ib.json'), '{}\n');
@@ -51,6 +52,7 @@ test('生成独立裁剪产物并保留组件依赖闭包', () => {
     assert.equal(existsSync(join(fixture.out, 'button/button.js')), true);
     assert.equal(existsSync(join(fixture.out, 'loading/loading.js')), true);
     assert.equal(existsSync(join(fixture.out, 'common/index.js')), true);
+    assert.equal(existsSync(join(fixture.out, 'miniprogram_npm/tslib/index.js')), true);
     assert.equal(existsSync(join(fixture.out, 'unused')), false);
     assert.equal(existsSync(join(fixture.out, '.wechatide.ib.json')), false);
   } finally {

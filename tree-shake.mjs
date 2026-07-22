@@ -319,7 +319,7 @@ function expandComponentClosure(distRoot, roots) {
 // 步骤 4：内嵌依赖闭包（保留文件对 dist 根下其它顶层条目/内嵌 npm 的引用）
 // ---------------------------------------------------------------------------
 const IMPORT_RE =
-  /(?:require\s*\(|import\s*\(|import\s+[^'"]*from\s+|import\s+|@import\s+|<wxs[^>]*\bsrc\s*=\s*)['"]([^'"]+)['"]/g;
+  /(?:require\s*\(|import\s*\(|import\s*[^'"]*?\bfrom\s*|import\s*|@import\s+|<wxs[^>]*\bsrc\s*=\s*)['"]([^'"]+)['"]/g;
 const WXS_SRC_RE = /\bsrc\s*=\s*['"]([^'"]+)['"]/g;
 
 function scanFileRefs(distRoot, file) {
