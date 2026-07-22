@@ -1,0 +1,16 @@
+{
+  "name": "tdesign-miniprogram-tree-shaking",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "tdesign-prune": "tree-shake.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
+
