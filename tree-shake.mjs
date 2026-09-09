@@ -10,18 +10,21 @@
  *
  * 用法：
  *   node tree-shake.mjs --app <appMiniprogramDir> --src <fullDistDir> --out <prunedDistDir> [--lib <pkgName>] [--dry-run] [--force]
+ *   node tree-shake.mjs --app <app> --src <fullDistDir> --check <existingPrunedDir>
  *
  *   --app      下游小程序源码根目录（含 app.json / pages / components 的 .json）
  *   --src      全量 tdesign dist 目录（只读）
- *   --out      输出裁剪后的 tdesign dist 目录（会先清空再写入）
+ *   --out      输出裁剪后的 tdesign dist 目录（会先清空再写入；与 --check 互斥时可省略）
  *   --lib      组件库 npm 包名（默认 tdesign-miniprogram，用于识别带库名前缀的引用）
  *   --dry-run  只打印将删除/保留清单，不写 out，不真正删
  *   --force    跳过"根集为空"安全护栏（谨慎使用，可能删光整个 dist）
+ *   --check    断言已有产物目录已按当前 app 裁剪（不写文件）。多余组件目录 / 未裁 icon.wxss 则失败。
+ *   --no-prune-icons  保留完整 icon.wxss（默认会按 app + 保留组件用到的图标名做子集）
  *
  * 算法：
  *   1. 求根集：扫描 app 下所有 .json（排除其 miniprogram_npm/）的 usingComponents /
  *      componentGenerics，凡 value 解析后落在 dist 内的，取其顶层组件目录名为根。
- *      根集为空时默认中止（防止误删整个库），可用 --force 强制继续。
+ *      根集为空时默认中止（防止误删整个库），可用 --force 强制执行。
  *   2. BFS 求传递闭包：读 dist 内组件 json 的 usingComponents/componentGenerics，
  *      把指向其它 tdesign 组件的相对路径解析进集合，迭代到不动点。
  *   3. 始终保留共享目录：common / mixins / locale / config-provider。
@@ -32,8 +35,14 @@
  *   5. 删除 dist 顶层中不在保留集的目录；保留 dist 根下的 .json/注册清单等工具文件。
  *   6. 删除 .wechatide.ib.json（微信 IDE 组件库 IB 索引，见 REDUNDANT_FILE_NAMES）：
  *      工具现场扫描 miniprogram_npm 识别组件库，产物无此文件则不登记、不读，避免 upload ENOENT。
+ *   7. 删除保留目录内的 *.d.ts / *.d.ts.map（运行时不需要）。
+ *   8. 若保留了 icon 组件：按 app + 保留组件源码中的图标名字面量，裁剪 icon.wxss 的 :before 规则。
+ *   9. 写入 .tdesign-pruned.json 裁剪清单，供 --check 与人工排查。
  *
  * 仅用 Node 内置模块，node 直接可跑。
+ *
+ * 消费端注意：不要用微信开发者工具「构建 npm」覆盖裁剪产物（会还原全量 dist）。
+ * 用 --check 守门。
  */
 
 import fs from 'node:fs';
@@ -44,15 +53,26 @@ import process from 'node:process';
 // CLI 解析
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const args = { app: '', src: '', out: '', dryRun: false, force: false, lib: 'tdesign-miniprogram' };
+  const args = {
+    app: '',
+    src: '',
+    out: '',
+    dryRun: false,
+    force: false,
+    lib: 'tdesign-miniprogram',
+    check: '',
+    pruneIcons: true,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--app') args.app = argv[++i];
     else if (a === '--src') args.src = argv[++i];
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--lib') args.lib = argv[++i];
+    else if (a === '--check') args.check = argv[++i];
     else if (a === '--dry-run' || a === '--dryRun') args.dryRun = true;
     else if (a === '--force') args.force = true;
+    else if (a === '--no-prune-icons') args.pruneIcons = false;
     else if (a === '-h' || a === '--help') args.help = true;
   }
   return args;
@@ -60,7 +80,11 @@ function parseArgs(argv) {
 
 function usage() {
   console.log(
-    'Usage: node tree-shake.mjs --app <appMiniprogramDir> --src <fullDistDir> --out <prunedDistDir> [--lib <pkgName>] [--dry-run] [--force]',
+    [
+      'Usage:',
+      '  node tree-shake.mjs --app <appMiniprogramDir> --src <fullDistDir> --out <prunedDistDir> [--lib <pkgName>] [--dry-run] [--force] [--no-prune-icons]',
+      '  node tree-shake.mjs --app <appMiniprogramDir> --src <fullDistDir> --check <existingPrunedDir> [--lib <pkgName>] [--no-prune-icons]',
+    ].join('\n'),
   );
 }
 
@@ -74,6 +98,10 @@ const ALWAYS_KEEP = new Set(['common', 'mixins', 'locale', 'config-provider']);
 // （勿改回「重写保留」：保留会让工具登记该组件库并在 build/upload 主动 open 它，一旦同步出现
 //   「删了还没写回」的中间态即 ENOENT。删除从源头消除这个面。）
 const REDUNDANT_FILE_NAMES = new Set(['.wechatide.ib.json']);
+const REDUNDANT_SUFFIXES = ['.d.ts.map', '.d.ts'];
+const MANIFEST_NAME = '.tdesign-pruned.json';
+const ICON_WXSS_REL = path.join('icon', 'icon.wxss');
+const ICON_EXTRA_FAIL_THRESHOLD = 100;
 
 // 内嵌 npm 容器目录名
 const EMBED_NPM_DIR = 'miniprogram_npm';
@@ -103,7 +131,7 @@ function exists(p) {
   }
 }
 
-function prepareOutputDir(srcRoot, outRoot, dryRun) {
+function prepareOutputDir(srcRoot, outRoot) {
   const normSrc = path.resolve(srcRoot);
   const normOut = path.resolve(outRoot);
   if (normOut === normSrc) {
@@ -114,7 +142,6 @@ function prepareOutputDir(srcRoot, outRoot, dryRun) {
     console.error('[error] --out 不能位于 --src 内部；请输出到独立目录');
     process.exit(1);
   }
-  if (dryRun) return normSrc;
 
   fs.rmSync(normOut, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(normOut), { recursive: true });
@@ -166,6 +193,18 @@ function readTextSafe(file) {
 }
 
 const kb = (bytes) => (bytes / 1024).toFixed(1);
+
+function fileSize(p) {
+  try {
+    return fs.statSync(p).size;
+  } catch {
+    return 0;
+  }
+}
+
+function hasRedundantSuffix(name) {
+  return REDUNDANT_SUFFIXES.some((suffix) => name.endsWith(suffix));
+}
 
 /**
  * 给定 dist 内某个引用路径（usingComponents/generics 的 value、或源码内 import 的相对路径），
@@ -255,7 +294,7 @@ function resolveSharedSubdir(distRoot, fromFile, ref) {
 // ---------------------------------------------------------------------------
 function collectRootComponents(appDir, distRoot) {
   const roots = new Set();
-  const skip = new Set([path.join(appDir, EMBED_NPM_DIR)]);
+  const skip = new Set([path.join(appDir, EMBED_NPM_DIR), path.join(appDir, 'node_modules')]);
   const jsonFiles = walkFiles(appDir, skip).filter((f) => f.endsWith('.json'));
 
   for (const jf of jsonFiles) {
@@ -353,6 +392,14 @@ function listSharedSubdirs(distRoot) {
     .map((e) => e.name);
 }
 
+function listTopDirs(root) {
+  if (!isDir(root)) return [];
+  return fs
+    .readdirSync(root, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+}
+
 /**
  * 内嵌依赖闭包（迭代到不动点）。同时计算：
  *  - keptTop：需保留的 dist 顶层条目（含 miniprogram_npm/<lib>）
@@ -427,46 +474,93 @@ function expandEmbedClosure(distRoot, keptComponents) {
   return { keptTop, keptShared };
 }
 
+// ---------------------------------------------------------------------------
+// icon.wxss 子集
+// ---------------------------------------------------------------------------
+const ICON_CLASS_RE = /\.t-icon-([a-z0-9-]+):before/g;
+const QUOTED_TOKEN_RE = /['"]([a-z0-9]+(?:-[a-z0-9]+)*)['"]/g;
+const ICON_RULE_RE = /\.t-icon-([a-z0-9-]+):before\{[^}]*\}/g;
+
+function parseKnownIconNames(wxss) {
+  const names = new Set();
+  ICON_CLASS_RE.lastIndex = 0;
+  let m;
+  while ((m = ICON_CLASS_RE.exec(wxss)) !== null) names.add(m[1]);
+  return names;
+}
+
+function collectQuotedTokens(text) {
+  const tokens = [];
+  QUOTED_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = QUOTED_TOKEN_RE.exec(text)) !== null) tokens.push(m[1]);
+  return tokens;
+}
+
+function collectUsedIconNames(files, known) {
+  const used = new Set();
+  for (const file of files) {
+    if (!/\.(wxml|js|ts|json|wxs)$/.test(file)) continue;
+    const text = readTextSafe(file);
+    for (const token of collectQuotedTokens(text)) {
+      if (known.has(token)) used.add(token);
+    }
+  }
+  return used;
+}
+
+function listIconScanFiles(appDir, distRoot, keepDirs) {
+  const files = [];
+  const appSkip = new Set([path.join(appDir, EMBED_NPM_DIR), path.join(appDir, 'node_modules')]);
+  files.push(...walkFiles(appDir, appSkip));
+  for (const name of keepDirs) {
+    const dir = path.join(distRoot, name);
+    if (isDir(dir)) files.push(...walkFiles(dir));
+  }
+  return files;
+}
+
+function buildPrunedIconWxss(original, used) {
+  ICON_RULE_RE.lastIndex = 0;
+  return original.replace(ICON_RULE_RE, (full, name) => (used.has(name) ? full : ''));
+}
+
+function resolveIconPlan(appDir, distRoot, keepDirs, pruneIcons) {
+  const iconWxss = path.join(distRoot, ICON_WXSS_REL);
+  if (!pruneIcons || !exists(iconWxss)) {
+    return { enabled: false, used: new Set(), knownCount: 0, originalBytes: 0 };
+  }
+  const original = readTextSafe(iconWxss);
+  const known = parseKnownIconNames(original);
+  if (known.size === 0) {
+    return { enabled: false, used: new Set(), knownCount: 0, originalBytes: original.length };
+  }
+  const used = collectUsedIconNames(listIconScanFiles(appDir, distRoot, keepDirs), known);
+  return {
+    enabled: used.size > 0,
+    used,
+    knownCount: known.size,
+    originalBytes: original.length,
+  };
+}
+
+function applyIconPrune(outRoot, iconPlan) {
+  const iconWxss = path.join(outRoot, ICON_WXSS_REL);
+  if (!iconPlan.enabled || !exists(iconWxss)) return 0;
+  const original = readTextSafe(iconWxss);
+  const pruned = buildPrunedIconWxss(original, iconPlan.used);
+  fs.writeFileSync(iconWxss, pruned);
+  return original.length - pruned.length;
+}
 
 // ---------------------------------------------------------------------------
-// 主流程
+// 裁剪计划
 // ---------------------------------------------------------------------------
-function main() {
-  const args = parseArgs(process.argv.slice(2));
-  if (args.help || !args.app || !args.src || !args.out) {
-    usage();
-    process.exit(args.help ? 0 : 1);
-  }
-  const appDir = path.resolve(args.app);
-  const srcRoot = path.resolve(args.src);
-  const outRoot = path.resolve(args.out);
-
-  if (!isDir(appDir)) {
-    console.error(`[error] --app 不是有效目录：${appDir}`);
-    process.exit(1);
-  }
-  if (!isDir(srcRoot)) {
-    console.error(`[error] --src 不是有效目录：${srcRoot}`);
-    process.exit(1);
-  }
-  const distRoot = prepareOutputDir(srcRoot, outRoot, args.dryRun);
-
-  LIB_MARKERS = [`${args.lib}/`];
-
-  log(`app  = ${appDir}`);
-  log(`src  = ${srcRoot}`);
-  log(`out  = ${outRoot}`);
-  log(`lib  = ${args.lib}`);
-  log(`mode = ${args.dryRun ? 'DRY-RUN（不写 out，不删文件）' : 'WRITE（写入 out 并裁剪）'}`);
-  log('');
-
-  // 1. 根集
+function buildPlan(appDir, distRoot, options) {
   const roots = collectRootComponents(appDir, distRoot);
-  // 2. 组件传递闭包
   const keptComponents = expandComponentClosure(distRoot, roots);
 
-  // 安全护栏：根集为空说明 --app 路径/包名很可能配错，继续执行会删光整个库
-  if (keptComponents.size === 0 && !args.force) {
+  if (keptComponents.size === 0 && !options.force) {
     console.error(
       `[error] 未从 --app 解析到任何落在 dist 内的 tdesign 组件引用（根集为空）。\n` +
         `        这通常意味着 --app 路径不对、--lib 包名不匹配，或 app 未使用该库。\n` +
@@ -475,47 +569,55 @@ function main() {
     process.exit(1);
   }
 
-  // 4. 内嵌依赖闭包（含 miniprogram_npm/<lib>）+ shared 子目录保留判定
   const { keptTop, keptShared } = expandEmbedClosure(distRoot, keptComponents);
-
-  // common/shared 待删子目录 = 全部 shared 子目录 - 已判定保留
   const sharedRoot = path.join(distRoot, 'common', 'shared');
-  const sharedDrop = new Set(
-    listSharedSubdirs(distRoot)
-      .filter((n) => !keptShared.has(n))
-      .map((n) => path.join(sharedRoot, n)),
-  );
+  const sharedDropRel = listSharedSubdirs(distRoot)
+    .filter((n) => !keptShared.has(n))
+    .map((n) => path.join('common', 'shared', n))
+    .sort();
 
-  // dist 顶层条目
   const topEntries = fs.readdirSync(distRoot, { withFileTypes: true });
-
   const keepDirs = [];
   const deleteDirs = [];
   const deleteRootFiles = [];
 
   for (const e of topEntries) {
     if (e.isDirectory()) {
-      if (e.name === EMBED_NPM_DIR) {
-        // 内嵌 npm 容器：逐个子库按 keptTop(miniprogram_npm/<lib>) 决定
-        continue;
-      }
+      if (e.name === EMBED_NPM_DIR) continue;
       if (ALWAYS_KEEP.has(e.name) || keptTop.has(e.name)) keepDirs.push(e.name);
       else deleteDirs.push(e.name);
     } else if (e.isFile() && REDUNDANT_FILE_NAMES.has(e.name)) {
-      // 根级冗余文件删除；其余根级工具文件（.json/.js/.ts/索引等）一律保留
       deleteRootFiles.push(e.name);
     }
   }
 
-  // #2：保留目录内任意层级的开发期冗余文件也要删（顶层遍历覆盖不到嵌套层）
   const nestedRedundant = [];
+  const nestedDts = [];
+  const recordIfRedundant = (abs) => {
+    const base = path.basename(abs);
+    const rel = path.relative(distRoot, abs);
+    if (REDUNDANT_FILE_NAMES.has(base)) nestedRedundant.push(rel);
+    else if (hasRedundantSuffix(base)) nestedDts.push(rel);
+  };
   for (const d of keepDirs) {
-    for (const f of walkFiles(path.join(distRoot, d))) {
-      if (REDUNDANT_FILE_NAMES.has(path.basename(f))) nestedRedundant.push(f);
+    for (const f of walkFiles(path.join(distRoot, d))) recordIfRedundant(f);
+  }
+  const embedRootForDts = path.join(distRoot, EMBED_NPM_DIR);
+  if (isDir(embedRootForDts)) {
+    for (const name of fs.readdirSync(embedRootForDts)) {
+      if (!keptTop.has(`${EMBED_NPM_DIR}/${name}`)) continue;
+      const sub = path.join(embedRootForDts, name);
+      if (isDir(sub)) {
+        for (const f of walkFiles(sub)) recordIfRedundant(f);
+      } else {
+        recordIfRedundant(sub);
+      }
     }
   }
+  for (const e of topEntries) {
+    if (e.isFile()) recordIfRedundant(path.join(distRoot, e.name));
+  }
 
-  // 内嵌 npm 子库
   const embedKeep = [];
   const embedDelete = [];
   const embedRoot = path.join(distRoot, EMBED_NPM_DIR);
@@ -527,89 +629,251 @@ function main() {
     }
   }
 
-  // common/shared 待删子目录（相对展示）
-  const sharedDropRel = [...sharedDrop].map((p) => path.relative(distRoot, p)).sort();
-
-  // ----- 统计与输出 -----
-  let deletedBytes = 0;
-  let deletedFiles = 0;
-  const tally = (p) => {
-    // 单次遍历同时累加大小与文件数（避免对每个目标重复 walk）
-    if (isDir(p)) {
-      for (const f of walkFiles(p)) {
-        deletedFiles += 1;
-        try {
-          deletedBytes += fs.statSync(f).size;
-        } catch {
-          /* ignore */
-        }
-      }
-    } else {
-      deletedFiles += 1;
-      try {
-        deletedBytes += fs.statSync(p).size;
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-
   const totalComponentDirs = topEntries.filter(
     (e) => e.isDirectory() && e.name !== EMBED_NPM_DIR && !ALWAYS_KEEP.has(e.name),
   ).length;
 
-  log('=== 保留组件闭包 (' + keptComponents.size + ') ===');
-  log([...keptComponents].sort().join(', '));
+  const iconPlan = resolveIconPlan(appDir, distRoot, keepDirs, options.pruneIcons);
+
+  return {
+    keptComponents,
+    keptTop,
+    keptShared,
+    keepDirs: keepDirs.sort(),
+    deleteDirs: deleteDirs.sort(),
+    deleteRootFiles,
+    nestedRedundant: nestedRedundant.sort(),
+    nestedDts: nestedDts.sort(),
+    embedKeep: embedKeep.sort(),
+    embedDelete: embedDelete.sort(),
+    sharedDropRel,
+    totalComponentDirs,
+    iconPlan,
+  };
+}
+
+function tallyPath(p) {
+  let files = 0;
+  let bytes = 0;
+  if (isDir(p)) {
+    for (const f of walkFiles(p)) {
+      files += 1;
+      bytes += fileSize(f);
+    }
+  } else if (exists(p)) {
+    files += 1;
+    bytes += fileSize(p);
+  }
+  return { files, bytes };
+}
+
+function printPlan(plan) {
+  log('=== 保留组件闭包 (' + plan.keptComponents.size + ') ===');
+  log([...plan.keptComponents].sort().join(', '));
   log('');
   log('=== 始终保留共享目录 ===');
-  log([...ALWAYS_KEEP].filter((k) => isDir(path.join(distRoot, k))).join(', '));
+  log(plan.keepDirs.filter((k) => ALWAYS_KEEP.has(k)).join(', ') || '(无)');
   log('');
-  log('=== 保留内嵌 npm (' + embedKeep.length + ') ===');
-  log(embedKeep.sort().join(', ') || '(无)');
+  log('=== 保留内嵌 npm (' + plan.embedKeep.length + ') ===');
+  log(plan.embedKeep.join(', ') || '(无)');
   log('');
-  log('=== 将删除组件目录 (' + deleteDirs.length + ') ===');
-  log(deleteDirs.sort().join(', ') || '(无)');
+  log('=== 将删除组件目录 (' + plan.deleteDirs.length + ') ===');
+  log(plan.deleteDirs.join(', ') || '(无)');
   log('');
-  log('=== 将删除内嵌 npm (' + embedDelete.length + ') ===');
-  log(embedDelete.sort().join(', ') || '(无)');
+  log('=== 将删除内嵌 npm (' + plan.embedDelete.length + ') ===');
+  log(plan.embedDelete.join(', ') || '(无)');
   log('');
-  log('=== 将删除 common/shared 子目录 (' + sharedDropRel.length + ') ===');
-  log(sharedDropRel.join(', ') || '(无)');
+  log('=== 将删除 common/shared 子目录 (' + plan.sharedDropRel.length + ') ===');
+  log(plan.sharedDropRel.join(', ') || '(无)');
   log('');
   log('=== 将删除根级冗余文件 ===');
-  log(deleteRootFiles.join(', ') || '(无)');
+  log(plan.deleteRootFiles.join(', ') || '(无)');
   log('');
-  log('=== 将删除嵌套冗余文件 (' + nestedRedundant.length + ') ===');
+  log('=== 将删除嵌套冗余文件 (' + plan.nestedRedundant.length + ') ===');
+  log(plan.nestedRedundant.join(', ') || '(无)');
+  log('');
+  log('=== 将删除 *.d.ts (' + plan.nestedDts.length + ') ===');
+  log(plan.nestedDts.length ? `${plan.nestedDts.length} 个类型声明` : '(无)');
+  log('');
+  if (plan.iconPlan.enabled) {
+    log(
+      `=== icon.wxss 子集：${plan.iconPlan.knownCount} → ${plan.iconPlan.used.size} 个图标 class ===`,
+    );
+    log([...plan.iconPlan.used].sort().join(', '));
+  } else if (!plan.iconPlan.knownCount) {
+    log('=== icon.wxss 子集：跳过（无 icon.wxss 或未开启） ===');
+  } else {
+    log('=== icon.wxss 子集：跳过（未解析到任何图标名，保留全量以防误删） ===');
+  }
+  log('');
   log(
-    nestedRedundant
-      .map((f) => path.relative(distRoot, f))
-      .sort()
-      .join(', ') || '(无)',
+    `=== 删除占比：组件目录 ${plan.deleteDirs.length}/${plan.totalComponentDirs}` +
+      `，内嵌 npm ${plan.embedDelete.length}/${plan.embedKeep.length + plan.embedDelete.length} ===`,
   );
   log('');
-  log(
-    `=== 删除占比：组件目录 ${deleteDirs.length}/${totalComponentDirs}` +
-      `，内嵌 npm ${embedDelete.length}/${embedKeep.length + embedDelete.length} ===`,
-  );
-  log('');
+}
 
-  // 收集待删绝对路径
+function collectDeleteTargets(distRoot, plan) {
   const targets = [];
-  for (const d of deleteDirs) targets.push(path.join(distRoot, d));
-  for (const e of embedDelete) targets.push(path.join(embedRoot, e));
-  for (const s of sharedDrop) targets.push(s);
-  for (const f of deleteRootFiles) targets.push(path.join(distRoot, f));
-  for (const f of nestedRedundant) targets.push(f);
+  for (const d of plan.deleteDirs) targets.push(path.join(distRoot, d));
+  const embedRoot = path.join(distRoot, EMBED_NPM_DIR);
+  for (const e of plan.embedDelete) targets.push(path.join(embedRoot, e));
+  for (const s of plan.sharedDropRel) targets.push(path.join(distRoot, s));
+  for (const f of plan.deleteRootFiles) targets.push(path.join(distRoot, f));
+  for (const f of plan.nestedRedundant) targets.push(path.join(distRoot, f));
+  for (const f of plan.nestedDts) targets.push(path.join(distRoot, f));
+  return targets;
+}
 
-  for (const t of targets) tally(t);
+function writeManifest(outRoot, plan, extra = {}) {
+  const manifest = {
+    lib: extra.lib || 'tdesign-miniprogram',
+    keptComponents: [...plan.keptComponents].sort(),
+    keptDirs: plan.keepDirs,
+    deletedComponents: plan.deleteDirs,
+    keptEmbed: plan.embedKeep,
+    deletedEmbed: plan.embedDelete,
+    keptShared: [...plan.keptShared].sort(),
+    deletedShared: plan.sharedDropRel,
+    keptIcons: [...plan.iconPlan.used].sort(),
+    iconWxssPruned: Boolean(plan.iconPlan.enabled),
+    ...extra,
+  };
+  fs.writeFileSync(path.join(outRoot, MANIFEST_NAME), JSON.stringify(manifest, null, 2) + '\n');
+}
 
-  if (args.dryRun) {
-    log(`[DRY-RUN] 将删除 ${deletedFiles} 个文件，约 ${kb(deletedBytes)} KB`);
-    log(`[DRY-RUN] 保留 ${keepDirs.length} 个组件/共享目录 + ${embedKeep.length} 个内嵌库`);
+function diffSorted(actual, expected) {
+  const extra = actual.filter((n) => !expected.has(n));
+  const missing = [...expected].filter((n) => !actual.includes(n));
+  return { extra, missing };
+}
+
+function checkExisting(checkDir, plan) {
+  if (!isDir(checkDir)) {
+    console.error(`[error] --check 不是有效目录：${checkDir}`);
+    process.exit(1);
+  }
+
+  const problems = [];
+  const actualDirs = listTopDirs(checkDir).filter((n) => n !== EMBED_NPM_DIR);
+  const expectedDirs = new Set(plan.keepDirs);
+  const dirDiff = diffSorted(actualDirs, expectedDirs);
+  if (dirDiff.extra.length) {
+    problems.push(`多余组件/目录（未裁剪或被「构建 npm」覆盖）：${dirDiff.extra.join(', ')}`);
+  }
+  if (dirDiff.missing.length) {
+    problems.push(`缺少应保留目录：${dirDiff.missing.join(', ')}`);
+  }
+
+  const actualEmbed = listTopDirs(path.join(checkDir, EMBED_NPM_DIR));
+  const expectedEmbed = new Set(plan.embedKeep);
+  const embedDiff = diffSorted(actualEmbed, expectedEmbed);
+  if (embedDiff.extra.length) {
+    problems.push(`多余内嵌 npm：${embedDiff.extra.join(', ')}`);
+  }
+  if (embedDiff.missing.length) {
+    problems.push(`缺少内嵌 npm：${embedDiff.missing.join(', ')}`);
+  }
+
+  const actualShared = listSharedSubdirs(checkDir);
+  const expectedShared = plan.keptShared;
+  const sharedDiff = diffSorted(actualShared, expectedShared);
+  if (sharedDiff.extra.length) {
+    problems.push(`多余 common/shared 子目录：${sharedDiff.extra.join(', ')}`);
+  }
+
+  const checkIconWxss = path.join(checkDir, ICON_WXSS_REL);
+  if (plan.iconPlan.enabled && exists(checkIconWxss)) {
+    const actualIcons = parseKnownIconNames(readTextSafe(checkIconWxss));
+    const extraIcons = [...actualIcons].filter((n) => !plan.iconPlan.used.has(n));
+    const stillFull = actualIcons.size >= plan.iconPlan.knownCount && extraIcons.length > 0;
+    if (stillFull || extraIcons.length > ICON_EXTRA_FAIL_THRESHOLD) {
+      problems.push(
+        `icon.wxss 未按需裁剪：现有 ${actualIcons.size} 个 class，按 app 只需 ${plan.iconPlan.used.size}（多余 ${extraIcons.length}）`,
+      );
+    }
+  }
+
+  if (problems.length) {
+    console.error('[error] --check 失败：已有产物与当前 app 的裁剪闭包不一致。');
+    for (const p of problems) console.error(`        - ${p}`);
+    console.error('        不要用微信开发者工具「构建 npm」覆盖裁剪产物；请重新运行裁剪。');
+    process.exit(1);
+  }
+
+  log('[CHECK] 已有产物与裁剪闭包一致');
+  log(`[CHECK] 组件目录 ${actualDirs.length}，内嵌 npm ${actualEmbed.length}，icon class ${plan.iconPlan.used.size}`);
+}
+
+// ---------------------------------------------------------------------------
+// 主流程
+// ---------------------------------------------------------------------------
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    usage();
+    process.exit(0);
+  }
+  if (!args.app || !args.src || (!args.out && !args.check)) {
+    usage();
+    process.exit(1);
+  }
+  const appDir = path.resolve(args.app);
+  const srcRoot = path.resolve(args.src);
+  const outRoot = args.out ? path.resolve(args.out) : '';
+  const checkDir = args.check ? path.resolve(args.check) : '';
+
+  if (!isDir(appDir)) {
+    console.error(`[error] --app 不是有效目录：${appDir}`);
+    process.exit(1);
+  }
+  if (!isDir(srcRoot)) {
+    console.error(`[error] --src 不是有效目录：${srcRoot}`);
+    process.exit(1);
+  }
+
+  LIB_MARKERS = [`${args.lib}/`];
+
+  log(`app  = ${appDir}`);
+  log(`src  = ${srcRoot}`);
+  if (outRoot) log(`out  = ${outRoot}`);
+  if (checkDir) log(`check= ${checkDir}`);
+  log(`lib  = ${args.lib}`);
+  if (checkDir) log('mode = CHECK（只断言，不写文件）');
+  else log(`mode = ${args.dryRun ? 'DRY-RUN（不写 out，不删文件）' : 'WRITE（写入 out 并裁剪）'}`);
+  log('');
+
+  const plan = buildPlan(appDir, srcRoot, { force: args.force, pruneIcons: args.pruneIcons });
+  printPlan(plan);
+
+  if (checkDir) {
+    checkExisting(checkDir, plan);
     return;
   }
 
+  const targets = collectDeleteTargets(srcRoot, plan);
+  let deletedFiles = 0;
+  let deletedBytes = 0;
   for (const t of targets) {
+    const { files, bytes } = tallyPath(t);
+    deletedFiles += files;
+    deletedBytes += bytes;
+  }
+
+  if (args.dryRun) {
+    log(`[DRY-RUN] 将删除 ${deletedFiles} 个文件，约 ${kb(deletedBytes)} KB`);
+    log(`[DRY-RUN] 保留 ${plan.keepDirs.length} 个组件/共享目录 + ${plan.embedKeep.length} 个内嵌库`);
+    if (plan.iconPlan.enabled) {
+      log(
+        `[DRY-RUN] icon.wxss 将保留 ${plan.iconPlan.used.size}/${plan.iconPlan.knownCount} 个图标 class`,
+      );
+    }
+    return;
+  }
+
+  const writtenRoot = prepareOutputDir(srcRoot, outRoot);
+  const writeTargets = collectDeleteTargets(writtenRoot, plan);
+  for (const t of writeTargets) {
     try {
       fs.rmSync(t, { recursive: true, force: true });
     } catch (err) {
@@ -617,18 +881,17 @@ function main() {
     }
   }
 
-  // 删除后统计 dist 剩余（单次遍历）
+  const iconSaved = applyIconPrune(writtenRoot, plan.iconPlan);
+  writeManifest(writtenRoot, plan, { lib: args.lib });
+
   let remainFiles = 0;
   let remainBytes = 0;
-  for (const f of walkFiles(distRoot)) {
+  for (const f of walkFiles(writtenRoot)) {
     remainFiles += 1;
-    try {
-      remainBytes += fs.statSync(f).size;
-    } catch {
-      /* ignore */
-    }
+    remainBytes += fileSize(f);
   }
   log(`[DONE] 已删除 ${deletedFiles} 个文件，约 ${kb(deletedBytes)} KB`);
+  if (iconSaved > 0) log(`[DONE] icon.wxss 子集节省约 ${kb(iconSaved)} KB`);
   log(`[DONE] dist 剩余 ${remainFiles} 个文件，约 ${kb(remainBytes)} KB`);
 }
 
